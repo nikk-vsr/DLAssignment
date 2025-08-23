@@ -1,127 +1,148 @@
+import pandas as pd
+import numpy as np
+import math
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
-from torchvision import datasets, transforms
-import numpy as np
-import matplotlib.pyplot as plt
-import os
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
 
-# Set device
+# Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Hyperparameters
-latent_dim = 100
-batch_size = 128
-epochs = 100
-lr = 0.0002
+# Load and preprocess data
+data_ = pd.read_csv('RELIANCE.NS.csv', index_col='Date', parse_dates=['Date'])
+data = data_.dropna(inplace=False)
 
-# Data loading and preprocessing
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5])
-])
+input_data = data[['Open', 'High', 'Volume']]
+output_data = data[['Close']].values
 
-train_dataset = datasets.FashionMNIST(root='./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+input_scaler = MinMaxScaler(feature_range=(0, 1))
+output_scaler = MinMaxScaler(feature_range=(0, 1))
 
-# Generator Model
-class Generator(nn.Module):
-    def __init__(self, latent_dim):
-        super(Generator, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(latent_dim, 7*7*128),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Unflatten(1, (128, 7, 7)),
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),  # 14x14
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.ConvTranspose2d(64, 1, 4, stride=2, padding=1),    # 28x28
-            nn.Tanh()
-        )
+scaled_data = input_scaler.fit_transform(input_data)
+scaled_output = output_scaler.fit_transform(output_data)
 
-    def forward(self, z):
-        return self.model(z)
+training_data_len = int(np.ceil(len(scaled_data) * 0.70))
+train_data = scaled_data[0:training_data_len, :]
+test_data = scaled_data[training_data_len:, :]
 
-# Discriminator Model
-class Discriminator(nn.Module):
-    def __init__(self):
-        super(Discriminator, self).__init__()
-        self.model = nn.Sequential(
-            nn.Conv2d(1, 64, 3, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.3),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout(0.3),
-            nn.Flatten(),
-            nn.Linear(128*7*7, 1),
-            nn.Sigmoid()
-        )
+x_train, x_test, y_train, y_test, y_test_org = [], [], [], [], []
+seq_length = 60
 
-    def forward(self, img):
-        return self.model(img)
+for i in range(len(train_data) - seq_length - 4):
+    x_train.append(train_data[i:(i + seq_length)])
+    y_train.append(scaled_output[(i + seq_length):(i + seq_length + 5)])
 
-# Initialize models
-generator = Generator(latent_dim).to(device)
-discriminator = Discriminator().to(device)
+for i in range(len(test_data) - seq_length - 4):
+    x_test.append(test_data[i:(i + seq_length)])
+    y_test.append(scaled_output[training_data_len + i + seq_length:
+                                training_data_len + i + seq_length + 5])
+    y_test_org.append(output_data[training_data_len + i + seq_length:
+                                  training_data_len + i + seq_length + 5])
 
-# Loss and optimizers
-adversarial_loss = nn.BCELoss()
-optimizer_G = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
-optimizer_D = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+x_train = np.array(x_train)
+y_train = np.array(y_train)
+x_test = np.array(x_test)
+y_test = np.array(y_test)
+y_test_org = np.array(y_test_org)
+
+print("x_train shape:", x_train.shape)
+print("y_train shape:", y_train.shape)
+print("x_test shape:", x_test.shape)
+print("y_test shape:", y_test.shape)
+print("y_test_org shape:", y_test_org.shape)
+
+# Convert to torch tensors
+x_train_t = torch.tensor(x_train, dtype=torch.float32)
+y_train_t = torch.tensor(y_train, dtype=torch.float32)
+x_test_t = torch.tensor(x_test, dtype=torch.float32)
+y_test_t = torch.tensor(y_test, dtype=torch.float32)
+
+train_dataset = TensorDataset(x_train_t, y_train_t)
+test_dataset = TensorDataset(x_test_t, y_test_t)
+
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+# Define LSTM Model
+class StockLSTM(nn.Module):
+    def __init__(self, input_size=3, hidden_size1=80, hidden_size2=50, output_size=5):
+        super(StockLSTM, self).__init__()
+        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
+        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
+        self.fc = nn.Linear(hidden_size2, output_size)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out, _ = self.lstm1(x)
+        out, _ = self.lstm2(out)
+        out = out[:, -1, :]  # Take last time step
+        out = self.fc(out)
+        out = self.relu(out)
+        return out
+
+model = StockLSTM().to(device)
+print(model)
+
+# Loss and optimizer
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # Training loop
-for epoch in range(epochs):
-    for i, (imgs, _) in enumerate(train_loader):
-        real_imgs = imgs.to(device)
-        batch_size_curr = real_imgs.size(0)
+num_epochs = 100
+train_losses = []
 
-        # Train Discriminator
-        z = torch.randn(batch_size_curr, latent_dim, device=device)
-        fake_imgs = generator(z)
+for epoch in range(num_epochs):
+    model.train()
+    epoch_loss = 0
+    for xb, yb in train_loader:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        optimizer.zero_grad()
+        outputs = model(xb)
+        loss = criterion(outputs, yb)
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item() * xb.size(0)
+    epoch_loss /= len(train_loader.dataset)
+    train_losses.append(epoch_loss)
+    if (epoch+1) % 10 == 0 or epoch == 0:
+        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {epoch_loss:.6f}')
 
-        real_labels = torch.ones(batch_size_curr, 1, device=device)
-        fake_labels = torch.zeros(batch_size_curr, 1, device=device)
+# Plot training loss
+plt.figure(figsize=(6, 6))
+plt.plot(train_losses)
+plt.title('Model Loss Over Epochs')
+plt.ylabel('Loss')
+plt.xlabel('Epoch')
+plt.legend(['Training Loss'], loc='upper right')
+plt.show()
 
-        optimizer_D.zero_grad()
-        real_loss = adversarial_loss(discriminator(real_imgs), real_labels)
-        fake_loss = adversarial_loss(discriminator(fake_imgs.detach()), fake_labels)
-        d_loss = real_loss + fake_loss
-        d_loss.backward()
-        optimizer_D.step()
+# Prediction and RMSE
+model.eval()
+predictions_scaled = []
+with torch.no_grad():
+    for xb, _ in test_loader:
+        xb = xb.to(device)
+        outputs = model(xb)
+        predictions_scaled.append(outputs.cpu().numpy())
+predictions_scaled = np.concatenate(predictions_scaled, axis=0)
+predictions_org = output_scaler.inverse_transform(predictions_scaled)
 
-        # Train Generator
-        optimizer_G.zero_grad()
-        gen_labels = torch.ones(batch_size_curr, 1, device=device)
-        g_loss = adversarial_loss(discriminator(fake_imgs), gen_labels)
-        g_loss.backward()
-        optimizer_G.step()
+y_test_org_flat = y_test_org.reshape(-1, 5)
+rmse = math.sqrt(mean_squared_error(y_test_org_flat, predictions_org))
+print("The root mean squared error is {}.".format(rmse))
 
-        if i % 100 == 0:
-            print(f"Epoch [{epoch+1}/{epochs}] Batch {i}/{len(train_loader)} \
-                  Loss D: {d_loss.item():.4f}, loss G: {g_loss.item():.4f}")
-
-    # Save generator after each epoch
-    torch.save(generator.state_dict(), f"generator_epoch_{epoch+1}.pth")
-
-# Generate and plot images
-def generate_images(generator, latent_dim, n_images=100):
-    generator.eval()
-    z = torch.randn(n_images, latent_dim, device=device)
-    with torch.no_grad():
-        gen_imgs = generator(z).cpu()
-    gen_imgs = gen_imgs * 0.5 + 0.5  # Denormalize
-    return gen_imgs
-
-def show_plot(images, n):
-    plt.figure(figsize=(10,10))
-    for i in range(n*n):
-        plt.subplot(n, n, i+1)
-        plt.axis('off')
-        plt.imshow(images[i][0], cmap='gray_r')
+# Plot predictions
+def plot_predictions(test, predicted):
+    plt.plot(test[:, 0], color='red', label='Real RIL Stock Price')
+    plt.plot(predicted[:, 0], color='blue', label='Predicted RIL Stock Price')
+    plt.title('RIL Stock Price Prediction')
+    plt.xlabel('Time')
+    plt.ylabel('RIL Stock Price')
+    plt.legend()
     plt.show()
 
-# Load the last saved generator and plot images
-generator.load_state_dict(torch.load(f"generator_epoch_{epochs}.pth", map_location=device))
-gen_imgs = generate_images(generator, latent_dim, 100)
-show_plot(gen_imgs, 10)
+plot_predictions(y_test_org_flat, predictions_org)
